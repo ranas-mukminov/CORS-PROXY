@@ -88,12 +88,16 @@ public class Server {
                 return false;
             }
 
-            // Resolve hostname to IP and check if it's private
+            // Check EVERY resolved address: one getByName result is not enough,
+            // the connection may use a different address from the same answer
             try {
-                InetAddress addr = InetAddress.getByName(host);
-                if (addr.isSiteLocalAddress() || addr.isLoopbackAddress() || addr.isLinkLocalAddress()) {
-                    LOGGER.warning("Blocked private network access: " + host + " -> " + addr.getHostAddress());
-                    return false;
+                for (InetAddress addr : InetAddress.getAllByName(host)) {
+                    if (addr.isLoopbackAddress() || addr.isSiteLocalAddress()
+                            || addr.isLinkLocalAddress() || addr.isMulticastAddress()
+                            || isLinkLocalIpv4(addr)) {
+                        LOGGER.warning("Blocked private network access: " + host + " -> " + addr.getHostAddress());
+                        return false;
+                    }
                 }
             } catch (UnknownHostException e) {
                 LOGGER.warning("Could not resolve hostname: " + host);
@@ -105,6 +109,12 @@ public class Server {
             LOGGER.log(Level.WARNING, "URL validation error", e);
             return false;
         }
+    }
+
+    // Explicit 169.254.0.0/16 check (link-local IPv4 range)
+    private static boolean isLinkLocalIpv4(InetAddress addr) {
+        byte[] b = addr.getAddress();
+        return b.length == 4 && b[0] == (byte) 169 && b[1] == (byte) 254;
     }
 
     /**
@@ -315,62 +325,89 @@ public class Server {
         InputStream cl2pr = exchange.getRequestBody();
         OutputStream pr2cl = exchange.getResponseBody();
 
-        HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+        HttpURLConnection conn = null;
+        int stCode;
+        // Follow redirects manually: blind following would let a redirect
+        // to an internal address bypass the SSRF guard above
+        for (int hops = 0; ; hops++) {
+            conn = (HttpURLConnection) url.openConnection();
+            conn.setInstanceFollowRedirects(false);
+            String hopMethod = (hops == 0) ? method : "GET";
 
-        try {
-            conn.setRequestMethod(method);
-        } catch (Throwable e) {
-            // Fallback: try to set method using reflection
             try {
-                Field mt = HttpURLConnection.class.getDeclaredField("method");
-                Field del = conn.getClass().getDeclaredField("delegate");
-                mt.setAccessible(true);
-                del.setAccessible(true);
-                mt.set(del.get(conn), method);
-            } catch (Exception ignore) {
-                LOGGER.warning("Failed to set HTTP method: " + method);
-                throw new HttpError(405);
+                conn.setRequestMethod(hopMethod);
+            } catch (Throwable e) {
+                // Fallback: try to set method using reflection
+                try {
+                    Field mt = HttpURLConnection.class.getDeclaredField("method");
+                    Field del = conn.getClass().getDeclaredField("delegate");
+                    mt.setAccessible(true);
+                    del.setAccessible(true);
+                    mt.set(del.get(conn), hopMethod);
+                } catch (Exception ignore) {
+                    LOGGER.warning("Failed to set HTTP method: " + hopMethod);
+                    throw new HttpError(405);
+                }
             }
-        }
 
-        outer:
-        for (Map.Entry<String, List<String>> pv : headers.entrySet()) {
-            if (pv.getKey() == null) continue;
-            if (pv.getValue() == null) continue;
-            String key = pv.getKey().toLowerCase();
-            if(ignoreRequestHeaders.contains(key))continue;
-            for(String v : ignoreRequestHeadersPrefix)
-                if(key.startsWith(v))continue outer;
+            outer:
+            for (Map.Entry<String, List<String>> pv : headers.entrySet()) {
+                if (pv.getKey() == null) continue;
+                if (pv.getValue() == null) continue;
+                String key = pv.getKey().toLowerCase();
+                if(ignoreRequestHeaders.contains(key))continue;
+                if (hops > 0 && (key.equals("content-length") || key.equals("content-type"))) continue;
+                for(String v : ignoreRequestHeadersPrefix)
+                    if(key.startsWith(v))continue outer;
 
-            for (String v : pv.getValue()) {
-                conn.addRequestProperty(pv.getKey(), v);
+                for (String v : pv.getValue()) {
+                    conn.addRequestProperty(pv.getKey(), v);
+                }
             }
+
+            conn.setConnectTimeout(10000);
+            conn.setDoInput(true);
+
+            //REQUEST: body goes out only on the first hop
+            if (hops == 0 && cl2pr.available() > 0) {
+                conn.setDoOutput(true);
+                OutputStream pr2sr = conn.getOutputStream();
+                copyStream(cl2pr, pr2sr);
+                cl2pr.close();
+            }
+
+            //RESPONSE
+            try {
+                stCode = conn.getResponseCode();
+            } catch (Throwable e) {
+                stCode = 445;
+                LOGGER.log(Level.WARNING, "Error getting response code from " + url, e);
+                break;
+            }
+
+            // Redirect: follow only GET, at most 5 hops, re-validating each Location
+            if (stCode != 301 && stCode != 302 && stCode != 303 && stCode != 307 && stCode != 308) break;
+            if (!"GET".equals(method) || hops >= 5) break;
+            String location = conn.getHeaderField("Location");
+            if (location == null) break;
+            URL next;
+            try {
+                next = new URL(url, location);
+            } catch (Exception e) {
+                break;
+            }
+            if (!isAllowedUrl(next.toString())) {
+                LOGGER.warning("SSRF attempt blocked on redirect: " + next + " from " + exchange.getRemoteAddress());
+                conn.disconnect();
+                throw new HttpError(403);
+            }
+            conn.disconnect();
+            url = next;
         }
 
-        conn.setConnectTimeout(10000);
-        conn.setDoInput(true);
-
-        //REQUEST
-        if (cl2pr.available() > 0) {
-            conn.setDoOutput(true);
-            OutputStream pr2sr = conn.getOutputStream();
-            copyStream(cl2pr, pr2sr);
-            cl2pr.close();
-        }
-
-        //RESPONSE
         List<String> expose = new ArrayList<>();
         expose.add("Access-Control-Expose-Headers");
         Headers gds = exchange.getResponseHeaders();
-        int stCode;
-        try {
-            stCode = conn.getResponseCode();
-        } catch (Throwable e) {
-            stCode = 445;
-            gds.add("x-cp-reason", e.toString());
-            expose.add("x-cp-reason");
-            LOGGER.log(Level.WARNING, "Error getting response code from " + url, e);
-        }
 
         Map<String, List<String>> headers2 = conn.getHeaderFields();
 
